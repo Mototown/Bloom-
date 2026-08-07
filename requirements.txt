@@ -1,0 +1,5 @@
+dbt-core>=1.7.0
+dbt-duckdb>=1.7.0
+pydantic>=2.0
+openai>=1.0
+python-dotenv
