@@ -1,16 +1,169 @@
-class BloomGenerator:
-    def generate_model(self, business_question: str, record):
-        model_sql = f"""-- Bloom Generated Model
--- {record.title}: {record.decision}
-SELECT * FROM stg_users"""
+from __future__ import annotations
 
-        schema_yml = f"""version: 2
-models:
-    - name: {record.related_model or 'my_model'}
-    description: {record.title}
-"""
+import json
+import os
+import re
+from typing import Dict, Optional
+
+from .decision_record import DecisionRecord
+
+
+SYSTEM_PROMPT = """You are Bloom, an expert dbt model designer.
+
+Your job is to turn a business question + a formal Decision Record into production-quality dbt artifacts.
+
+Rules you MUST follow:
+1. The DecisionRecord is the source of truth. The SQL and YAML must faithfully implement the recorded decision.
+2. Prefer incremental-friendly patterns and clear grain comments.
+3. Use clear CTEs, meaningful aliases, and standard dbt best practices.
+4. Never invent facts that contradict the decision or context.
+5. Output ONLY valid JSON with exactly these three keys:
+   - "model_sql": the full contents of the .sql file (including config block if useful)
+   - "schema_yml": a valid schema.yml fragment (version: 2)
+   - "model_name": the final model name (snake_case)
+
+Do not wrap the JSON in markdown. Do not add commentary outside the JSON."""
+
+
+class BloomGenerator:
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI()
+        return self._client
+
+    def generate_model(
+        self,
+        business_question: str,
+        record: DecisionRecord,
+        *,
+        use_llm: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """Generate model.sql + schema.yml + decision_record.md.
+
+        If use_llm is None, automatically uses LLM when OPENAI_API_KEY is present.
+        """
+        if use_llm is None:
+            use_llm = bool(os.getenv("OPENAI_API_KEY"))
+
+        if use_llm:
+            try:
+                return self._generate_with_llm(business_question, record)
+            except Exception as e:
+                print(f"[bloom] LLM generation failed ({e}), falling back to template mode")
+                return self._generate_template(business_question, record)
+
+        return self._generate_template(business_question, record)
+
+    def _generate_with_llm(self, business_question: str, record: DecisionRecord) -> Dict[str, str]:
+        client = self._get_client()
+
+        user_content = f"""Business question:
+{business_question}
+
+Decision Record:
+{record.model_dump_json(indent=2)}
+
+Generate the three artifacts now."""
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+
+        model_name = data.get("model_name") or record.related_model or "generated_model"
+        model_sql = data.get("model_sql", "-- generation failed")
+        schema_yml = data.get("schema_yml", "version: 2\nmodels: []")
+
+        if not model_sql.lstrip().startswith("--"):
+            header = (
+                f"-- Bloom generated model\n"
+                f"-- Decision: {record.id} — {record.title}\n"
+                f"-- {record.decision}\n\n"
+            )
+            model_sql = header + model_sql
+
         return {
             "model.sql": model_sql,
             "schema.yml": schema_yml,
-            "decision_record.md": record.to_markdown()
+            "decision_record.md": record.to_markdown(),
+            "model_name": model_name,
         }
+
+    def _generate_template(self, business_question: str, record: DecisionRecord) -> Dict[str, str]:
+        """High-quality deterministic fallback that still embeds the decision."""
+        model_name = record.related_model or _slugify(record.title) or "generated_model"
+
+        model_sql = f"""-- Bloom generated model (template mode)
+-- Decision ID : {record.id}
+-- Title       : {record.title}
+-- Decision    : {record.decision}
+-- Question    : {business_question}
+
+{{{{ config(
+    materialized='table',
+    tags=['bloom', 'decision-aware']
+) }}}}
+
+/*
+  This model implements the recorded decision above.
+  Replace the placeholder logic with the real transformation
+  that matches the grain and filters described in the ADR.
+*/
+
+with source as (
+    select * from {{{{ ref('stg_example') }}}}
+),
+
+final as (
+    select
+        *
+        -- TODO: implement the transformation described in the decision record
+    from source
+)
+
+select * from final
+"""
+
+        schema_yml = f"""version: 2
+
+models:
+  - name: {model_name}
+    description: |
+      {record.title}
+
+      **Decision:** {record.decision}
+
+      Generated by Bloom from Decision Record `{record.id}`.
+    meta:
+      bloom_decision_id: {record.id}
+      bloom_author: {record.author or "unknown"}
+    columns:
+      - name: example_column
+        description: Replace with real columns that match the decision grain.
+"""
+
+        return {
+            "model.sql": model_sql,
+            "schema.yml": schema_yml,
+            "decision_record.md": record.to_markdown(),
+            "model_name": model_name,
+        }
+
+
+def _slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")[:60]
